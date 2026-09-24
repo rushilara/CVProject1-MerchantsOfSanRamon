@@ -23,3 +23,7 @@ Computer_Vision_Project_1_(Q1_4)_Merchants_Of_San_Ramon.ipynb
 
 # Generated Kaggle CSVs (keep participant/sample_submission.csv)
 /submission_*.csv
+
+# Resumable prediction checkpoints
+/submission_*.checkpoints/
+/submission_*.csv.partial

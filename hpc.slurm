@@ -2,10 +2,8 @@
 # Run on a single HPC node. Adjust the partition / account for your cluster.
 #   sbatch hpc.slurm
 #
-# The job:
-#   1. finer 5° × 7-scale correlation sweep for every scene (Q5_FINE=1)
-#   2. held-out sweep of figure-stage rules on train + synthetic
-#   3. writes submission_hpc.csv
+# Cached submission only; use torch_cpu.slurm for NYU Torch.
+# No correlation search or parameter sweep is started.
 #
 #SBATCH --job-name=q5hpc
 #SBATCH --nodes=1
@@ -26,6 +24,10 @@ else
   export Q5_WORKERS="${Q5_WORKERS:-32}"
 fi
 export Q5_FINE=1
+export Q5_CACHE="${Q5_CACHE:-$PWD/cache_hpc}"
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
 export OMP_NUM_THREADS=1
 export OPENCV_NUM_THREADS=1
 
@@ -38,5 +40,6 @@ if miss:
 print("python", sys.executable, "workers", os.environ.get("Q5_WORKERS"))
 PY
 
-python -u q5_hpc.py --all
+python -u q5_hpc.py --smoke
+python -u q5_hpc.py --submit
 echo "done. submission_hpc.csv is ready to upload."

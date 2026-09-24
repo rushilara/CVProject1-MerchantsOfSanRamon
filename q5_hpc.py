@@ -30,11 +30,13 @@ Environment:
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import pickle
 import sys
 import time
-from concurrent.futures import ProcessPoolExecutor
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import cv2
@@ -159,7 +161,10 @@ def infer_pool(maps, sky_shape):
 
 
 def resolve_cache(tag):
-    for folder in (HERE / "cache_hpc", HERE / "cache_v3", CACHE):
+    # An explicit cache directory is authoritative. Never silently mix it
+    # with older local caches (especially on a cluster).
+    folders = (CACHE,) if "Q5_CACHE" in os.environ else (CACHE, HERE / "cache_hpc", HERE / "cache_v3")
+    for folder in folders:
         if (folder / f"{tag}.pkl").exists() and (folder / f"{tag}_maps.npy").exists():
             return folder
     return None
@@ -180,15 +185,34 @@ def search_folder(sky_path, patch_paths, tag, workers=None, force=False):
         sky = load_gray(sky_path).astype(np.float32)
         out = [search_patch(sky, q) for q in images]
     else:
+        # spawn, not fork: the parent has already imported cv2, and forking
+        # OpenCV workers is a known hang. The last job sat 8 hours on the
+        # first scene at ~300 MB RSS, i.e. the pool never ran.
+        workers = min(workers, len(images))
+        print(f"  {len(images)} patches, {workers} spawn workers", flush=True)
+        ctx = mp.get_context("spawn")
+        out = [None] * len(images)
+        done = 0
+        t0 = time.time()
         with ProcessPoolExecutor(
             max_workers=workers,
+            mp_context=ctx,
             initializer=_init,
             initargs=(str(sky_path), ANGLES, SCALES, DEFAULT_POOL),
         ) as pool:
-            out = list(pool.map(_work, images, chunksize=1))
+            futs = {pool.submit(_work, image): i for i, image in enumerate(images)}
+            for fut in as_completed(futs):
+                index = futs[fut]
+                out[index] = fut.result()
+                done += 1
+                print(f"  {tag} {done}/{len(images)} {time.time() - t0:.0f}s", flush=True)
     hyps = [o[0] for o in out]
     maps = np.stack([o[1] for o in out])
-    np.save(CACHE / f"{tag}_maps.npy", maps)
+    # Write the map first, the hypothesis file last. A preempted job then
+    # resumes from the last scene that has both files.
+    partial = CACHE / f".{tag}_maps.partial.npy"
+    np.save(partial, maps)
+    os.replace(partial, CACHE / f"{tag}_maps.npy")
     with (CACHE / f"{tag}.pkl").open("wb") as handle:
         pickle.dump((names, hyps), handle)
     return names, hyps, np.load(CACHE / f"{tag}_maps.npy", mmap_mode="r")
@@ -209,10 +233,13 @@ class Claims:
     def __init__(self, maps, radius, pool):
         self.pool = pool
         self.pad = 16.0 + 0.5 * (pool - 1)
-        self.dil = np.stack([
-            maximum_filter(np.asarray(m, dtype=np.float32), size=2 * radius + 1, mode="nearest")
-            for m in maps
-        ]).astype(np.float16)
+        # Keep only one float32 plane live, rather than a list and stacked
+        # copy of every plane. The float16 values are identical.
+        self.dil = np.empty(maps.shape, dtype=np.float16)
+        for index, m in enumerate(maps):
+            self.dil[index] = maximum_filter(
+                np.asarray(m, dtype=np.float32), size=2 * radius + 1, mode="nearest"
+            )
         self.best = self.dil.max(axis=0).astype(np.float32)
         self.shape = self.best.shape
 
@@ -584,27 +611,132 @@ def score_prepared(prepared, p=PARAMS, verbose=False):
     return rows
 
 
-def write_submission(patterns, out_path, p=PARAMS):
+def validate_caches(sample):
+    """Fail before any identification if inputs are missing or inconsistent."""
+    resolved = {}
+    for _, record in sample.iterrows():
+        scene = record["Id"]
+        tag = f"val_{scene}"
+        folder = resolve_cache(tag)
+        if folder is None:
+            raise RuntimeError(f"Missing cache for {tag}; refusing to start an expensive search. "
+                               "Set Q5_CACHE to the completed cache directory.")
+        with (folder / f"{tag}.pkl").open("rb") as handle:
+            names, hyps = pickle.load(handle)
+        maps = np.load(folder / f"{tag}_maps.npy", mmap_mode="r")
+        expected = [f"patch_{i:02d}" for i in range(1, int(record["n_patches"]) + 1)]
+        scene_dir = ROOT / "validation" / scene
+        if names != expected or len(hyps) != len(expected):
+            raise ValueError(f"{tag}: cache patch names/count do not match sample submission")
+        with Image.open(scene_dir / f"{scene}_image.png") as im:
+            w, h = im.size
+        valid_shapes = {((h - 31 + pool - 1) // pool, (w - 31 + pool - 1) // pool)
+                        for pool in (2, 4)}
+        if maps.ndim != 3 or maps.shape[0] != len(names) or maps.shape[1:] not in valid_shapes:
+            raise ValueError(f"{tag}: unexpected map shape {maps.shape}")
+        if not np.issubdtype(maps.dtype, np.floating):
+            raise ValueError(f"{tag}: expected floating-point maps")
+        for name in names:
+            if not (scene_dir / "patches" / f"{name}.png").is_file():
+                raise FileNotFoundError(f"{tag}: missing {name}.png")
+        resolved[tag] = folder
+    return resolved
+
+
+def smoke():
+    """Validate every cache header and patch list; exercise eight claim planes."""
+    import resource
     sample = pd.read_csv(ROOT / "sample_submission.csv")
+    resolved = validate_caches(sample)
+    paths = [folder / f"{tag}_maps.npy" for tag, folder in resolved.items()]
+    path = min(paths, key=lambda p: p.stat().st_size)
+    maps = np.load(path, mmap_mode="r")
+    scene = path.name.removeprefix("val_").removesuffix("_maps.npy")
+    with Image.open(ROOT / "validation" / scene / f"{scene}_image.png") as im:
+        shape = (im.height, im.width)
+    claims = Claims(maps[:min(8, len(maps))], PARAMS["claim_radius"], infer_pool(maps, shape))
+    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    rss_mb = rss / (1024 ** 2 if sys.platform == "darwin" else 1024)
+    print(f"smoke ok: {len(resolved)} validated caches; {path.name} "
+          f"maps {maps.shape}, claims {claims.dil.shape}, peak RSS {rss_mb:.0f} MiB", flush=True)
+
+
+def _atomic_json(path, payload):
+    partial = path.with_name(path.name + ".partial")
+    partial.write_text(json.dumps(payload, sort_keys=True))
+    os.replace(partial, path)
+
+
+def _run_signature(patterns, p):
+    digest = hashlib.sha256()
+    digest.update(json.dumps(dict(params=p, fine=FINE), sort_keys=True).encode())
+    for filename in ("q5_hpc.py", "q5_identify.py", "q5_search.py", "q5_synth.py", "q5_constellation.py"):
+        digest.update((HERE / filename).read_bytes())
+    for name, nodes in sorted(patterns.items()):
+        digest.update(name.encode())
+        digest.update(np.asarray(nodes).tobytes())
+    return digest.hexdigest()
+
+
+def _scene_signature(run_signature, folder, tag, scene_dir, record):
+    # Cache map files are large: use file metadata rather than rereading GBs.
+    paths = [folder / f"{tag}.pkl", folder / f"{tag}_maps.npy",
+             scene_dir / f"{scene_dir.name}_image.png"]
+    paths += sorted((scene_dir / "patches").glob("patch_*.png"))
+    metadata = [(str(path.resolve()), path.stat().st_size, path.stat().st_mtime_ns) for path in paths]
+    payload = [run_signature, str(record["Id"]), int(record["n_patches"]), metadata]
+    return hashlib.sha256(json.dumps(payload).encode()).hexdigest()
+
+
+def write_submission(patterns, out_path, p=PARAMS, only=None):
+    sample = pd.read_csv(ROOT / "sample_submission.csv")
+    if only is not None:
+        sample = sample[sample["Id"].isin(only)]
+    if sample.empty:
+        raise ValueError("No requested scenes found")
+    # Submission never calls search_scene: missing caches cannot start a search.
+    resolved = validate_caches(sample)
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir = out_path.with_suffix(".checkpoints")
+    checkpoint_dir.mkdir(exist_ok=True)
+    run_signature = _run_signature(patterns, p)
     rows = []
     for _, record in sample.iterrows():
         scene = record["Id"]
-        folder = ROOT / "validation" / scene
+        scene_dir = ROOT / "validation" / scene
         tag = f"val_{scene}"
+        folder = resolved[tag]
+        signature = _scene_signature(run_signature, folder, tag, scene_dir, record)
+        checkpoint = checkpoint_dir / f"{scene}.json"
+        if checkpoint.exists():
+            saved = json.loads(checkpoint.read_text())
+            if saved.get("signature") == signature:
+                rows.append(saved["row"])
+                print(f"{scene}: resumed completed prediction", flush=True)
+                continue
         t = time.time()
-        names, hyps, maps = search_scene(folder, tag)
-        sky = load_sky(folder)
-        queries = load_queries(folder, names)
+        with (folder / f"{tag}.pkl").open("rb") as handle:
+            names, hyps = pickle.load(handle)
+        maps = np.load(folder / f"{tag}_maps.npy", mmap_mode="r")
+        sky = load_sky(scene_dir)
+        queries = load_queries(scene_dir, names)
         name, fig, table = figure_stage(hyps, maps, sky, patterns, p)
         if table:
             fig["margin"] = table[0][0] - (table[1][0] if len(table) > 1 else -10.0)
         res = finalize(names, hyps, fig, sky, queries, p)
-        rows.append(format_row(scene, int(record["n_patches"]), res, name))
+        row = format_row(scene, int(record["n_patches"]), res, name)
+        _atomic_json(checkpoint, dict(signature=signature, row=row))
+        rows.append(row)
         n_fig = sum(1 for v in res.values() if v[2] == 1)
         top = [(round(r[0], 2), r[1]) for r in table[:3]]
-        print(f"{scene}: {name:16} figure {n_fig} top {top} {time.time() - t:.0f}s", flush=True)
-    pd.DataFrame(rows, columns=sample.columns).to_csv(out_path, index=False)
-    print(f"wrote {out_path}", flush=True)
+        print(f"{scene}: {name:16} figure {n_fig} top {top} {time.time() - t:.0f}s; saved", flush=True)
+        # Release the previous scene before constructing the next claim stack.
+        del fig, table, maps, sky, queries
+    partial = out_path.with_name(out_path.name + ".partial")
+    pd.DataFrame(rows, columns=sample.columns).to_csv(partial, index=False)
+    os.replace(partial, out_path)
+    print(f"wrote complete {len(rows)}-scene submission: {out_path}", flush=True)
 
 
 def sweep(patterns, scenes, base=None):
@@ -628,7 +760,10 @@ def sweep(patterns, scenes, base=None):
         real_id = [m["identification"] for k, m, _ in rows if k.startswith("train_")]
         syn_id = [m["identification"] for k, m, _ in rows if k.startswith("syn_")]
         score = (np.mean(real) if real else 0) * 3 + (np.mean(syn) if syn else 0) * 16
-        results.append((cfg, score, real, syn, real_id, syn_id, prep))
+        # Do not keep `prep`. Each one holds dilated claim maps for every scene,
+        # and 24 of those copies blew past 48 GB on job 18399338.
+        results.append((cfg, score, real, syn, real_id, syn_id))
+        del prep
         print(
             f"{cfg}  real {np.mean(real):.3f} ({sum(real_id)}/{len(real_id)} id)  "
             f"syn {np.mean(syn):.3f} ({sum(syn_id)}/{len(syn_id)} id)",
@@ -638,7 +773,8 @@ def sweep(patterns, scenes, base=None):
     print("best", best[0], flush=True)
     (HERE / "cache_v3").mkdir(exist_ok=True)
     (HERE / "cache_v3" / "best_hpc.pkl").write_bytes(pickle.dumps(best[0]))
-    return best
+    prep = prepare(scenes, patterns, dict(base, **best[0]), verbose=False, proposal_cache=cache)
+    return best[0], prep
 
 
 def search_missing(patterns=None):
@@ -648,12 +784,13 @@ def search_missing(patterns=None):
     if syn.exists():
         todo += [(f"syn_{d.name}", d) for d in sorted(syn.iterdir()) if d.is_dir()]
     for tag, folder in todo:
-        if resolve_cache(tag) is not None and not FINE:
+        fine_done = (CACHE / f"{tag}.pkl").exists() and (CACHE / f"{tag}_maps.npy").exists()
+        if fine_done or (resolve_cache(tag) is not None and not FINE):
             print(f"cached {tag}", flush=True)
             continue
         print(f"searching {tag} workers={WORKERS} fine={int(FINE)}", flush=True)
         t = time.time()
-        search_scene(folder, tag, force=FINE)
+        search_scene(folder, tag, force=True)
         print(f"done {tag} {time.time() - t:.0f}s", flush=True)
 
 
@@ -663,20 +800,20 @@ if __name__ == "__main__":
     if "--search-all" in args or "--all" in args:
         search_missing(patterns)
     if "--sweep" in args or "--all" in args:
-        best = sweep(patterns, labelled_scenes())
-        PARAMS.update(best[0])
-        rows = score_prepared(best[6], dict(PARAMS), verbose=True)
+        cfg, prep = sweep(patterns, labelled_scenes())
+        PARAMS.update(cfg)
+        rows = score_prepared(prep, dict(PARAMS), verbose=True)
         print("mean", np.mean([m["total"] for _, m, _ in rows]), flush=True)
     elif "--eval" in args:
         prep = prepare(labelled_scenes(), patterns)
         rows = score_prepared(prep, verbose=True)
         print("mean", np.mean([m["total"] for _, m, _ in rows]), flush=True)
-    if "--submit" in args or "--all" in args:
-        best_path = HERE / "cache_v3" / "best_hpc.pkl"
-        if best_path.exists():
-            PARAMS.update(pickle.loads(best_path.read_bytes()))
-            print("using", PARAMS, flush=True)
-        write_submission(patterns, HERE / "submission_hpc.csv")
+    if "--smoke" in args or "--submit" in args or "--all" in args:
+        print("using", PARAMS, flush=True)
+        if "--smoke" in args and "--submit" not in args and "--all" not in args:
+            smoke()
+        else:
+            write_submission(patterns, HERE / "submission_hpc.csv")
     if not args:
         print("usage: q5_hpc.py [--search-all] [--eval] [--sweep] [--submit] [--all]", flush=True)
         print(f"Q5_FINE={int(FINE)} Q5_WORKERS={WORKERS} CACHE={CACHE}", flush=True)

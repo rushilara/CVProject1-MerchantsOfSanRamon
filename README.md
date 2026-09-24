@@ -1,61 +1,52 @@
-# Constellation detection — Colab / HPC run
+# Constellation detection — deadline workflow
 
-This branch is what you run for the Kaggle question. Open the notebook on Colab, clone this branch, run all cells, upload `submission_hpc.csv`.
+Use the existing completed correlation caches. The default notebook and Slurm scripts run **cached submission only**, without another correlation search or synthetic parameter sweep.
 
-## What to run
+## NYU Torch
 
-**Notebook:** `Computer_Vision_Project_1_Question_5_HPC.ipynb`
-
-That is the only notebook you need. It calls `q5_hpc.py`. Do not run the older Q5 notebooks on Colab.
-
-## Colab (recommended)
-
-1. Runtime → Change runtime type → **CPU**. Turn on **High-RAM** if you have Colab Pro. Do **not** pick a GPU — the pipeline is `cv2.matchTemplate` on CPU.
-2. Upload this notebook to Colab, or open it from the GitHub branch.
-3. In the first code cell, keep the clone URL/branch as-is (or set `PROJECT` if you already copied the repo onto Drive).
-4. Run all cells in order. Stage 1 (correlation sweep) can take several hours on Colab; results land in `cache_hpc/` so a reconnect can continue.
-5. The last cell writes `submission_hpc.csv` and downloads it. Upload that file to Kaggle.
-
-### Packages
-
-The first cell installs these. Nothing else is required (no PyTorch, no TensorFlow, no CUDA):
-
-```
-opencv-python-headless
-numpy
-scipy
-pandas
-pillow
-```
-
-Same list is in `requirements-hpc.txt`.
-
-### Files this notebook needs (all on this branch)
-
-| Path | Why |
-| --- | --- |
-| `q5_hpc.py` | Search, identify, sweep, write CSV |
-| `q5_identify.py` | Pattern nodes, geometric hash, sky support |
-| `q5_constellation.py` | Score + submission row format |
-| `q5_search.py` | Rotate/scale + sub-pixel peak |
-| `q5_synth.py` | Star catalog (and building extra synthetic scenes) |
-| `participant/` | Train + validation skies, patches, 48 pattern PNGs, CSVs |
-| `synthetic/` | Extra labelled scenes for the rule sweep |
-
-`cache_v3/` is **not** on this branch (it is ~1.5 GB). Leave `Q5_FINE=1` so Colab rebuilds a finer cache under `cache_hpc/`.
-
-## Real HPC node (optional)
+Use `/scratch/ra4880/q5const` and its existing `cache_hpc/`. Copy the updated Python files and `torch_cpu.slurm` there before submitting. This repository update does not update or restart an already running cluster job.
 
 ```bash
-git clone -b colab-hpc git@github.com:rushilara/CVProject1-MerchantsOfSanRamon.git
-cd CVProject1-MerchantsOfSanRamon
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements-hpc.txt
-export Q5_FINE=1 Q5_WORKERS=32
-python -u q5_hpc.py --all
-# or: sbatch hpc.slurm
+cd /scratch/ra4880/q5const
+mkdir -p logs
+sbatch --account=torch_pr_37_lpinto --partition=cs torch_cpu.slurm
 ```
 
-## What not to commit / upload
+The script validates all 16 validation cache headers, patch lists and source files, then runs `--submit`. It uses the defaults in `PARAMS`; an old `best_hpc.pkl` is no longer loaded automatically. Do not launch `--all`, `--sweep`, or `--search-all` for this deadline workflow.
 
-Ignored on purpose: `cache_v3/` and other caches, lecture PDFs, the 22 MB Q1–4 notebook, `__pycache__/`, generated `submission_*.csv`.
+Each completed scene is saved under `submission_hpc.checkpoints/`. If interrupted, rerun the same command to reuse completed predictions. Checkpoints are invalidated when code, prediction parameters, pattern nodes or input-file metadata change. Keep code and inputs unchanged during a run; do not run two writers against the same output path concurrently.
+
+The complete `submission_hpc.csv` is replaced atomically only after every scene succeeds. An older CSV may remain after a failed run, so wait for the explicit `wrote complete 16-scene submission` message before uploading.
+
+## Local or notebook execution
+
+`Computer_Vision_Project_1_Question_5_HPC.ipynb` follows the same cached-only workflow. It requires the completed caches; cloning the repository does not supply them. Run on an allocated compute node, not an HPC login node.
+
+```bash
+# With the completed fine caches:
+Q5_FINE=1 Q5_CACHE=/path/to/cache_hpc python -u q5_hpc.py --smoke
+Q5_FINE=1 Q5_CACHE=/path/to/cache_hpc python -u q5_hpc.py --submit
+```
+
+Without overrides, local execution uses the available coarse `cache_v3` first. Coarse and fine runs have different search evidence and proposal settings, so their scores and timings are not interchangeable. An explicitly supplied `Q5_CACHE` is authoritative: missing or malformed caches stop before inference and never trigger a search.
+
+Dependencies: `pip install -r requirements-hpc.txt`. This pipeline uses CPU OpenCV/NumPy/SciPy, not a GPU. Cached submission currently processes scenes sequentially; the search-worker count does not parallelize it. Full fine-cache runtime has not been measured by this review.
+
+## Kaggle metric
+
+The supplied competition description specifies the scene-wise mean of:
+
+- 25% presence: macro F1 for present versus absent.
+- 20% localization: mean over truly present queries; full credit within 12 px, linear decay to zero at 36 px; missed queries earn zero.
+- 25% geometric recovery: greedy one-to-one nearest-pair matching of issued figure stars to all reported-present points, using the same distance reward. This term does not filter by predicted `m`.
+- 30% identification: exact constellation name.
+
+`q5_constellation.score_scene` follows this description. Scenes have equal weight regardless of patch count. Reference drawings may differ in aspect ratio as well as orientation, scale and handedness; the existing similarity-only proposal model does not fully cover this requirement. The brightest-120-star filter also excludes most labeled figure stars. Do not infer generalization from tuning on only three training scenes.
+
+## Fast regression checks
+
+```bash
+OPENBLAS_NUM_THREADS=1 python -m unittest test_q5_hpc -v
+```
+
+These check exact claim-map values, interrupted-run resume, checkpoint invalidation and missing/mismatched cache rejection. They do not perform the expensive search or prove leaderboard performance.

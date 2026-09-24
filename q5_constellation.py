@@ -360,6 +360,10 @@ def score_scene(truth, prediction, constellation_hat, constellation_true):
     for name, true in truth.items():
         pred = prediction.get(name, (-1, -1, -1))
         pred_present = pred[2] != -1 and pred[0] != -1
+        # Kaggle matches figure stars against ALL reported-present points,
+        # including false-positive queries and regardless of the m flag.
+        if pred_present:
+            predicted_present.append((pred[0], pred[1]))
         if true is None:
             if pred_present:
                 # Called a missing patch present.
@@ -372,7 +376,6 @@ def score_scene(truth, prediction, constellation_hat, constellation_true):
                 present_tp += 1
                 distance = float(np.hypot(pred[0] - true[0], pred[1] - true[1]))
                 loc_rewards.append(localization_reward(distance))
-                predicted_present.append((pred[0], pred[1]))
             else:
                 # Missed a patch that is in the sky.
                 present_fn += 1
