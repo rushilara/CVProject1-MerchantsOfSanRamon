@@ -1,9 +1,8 @@
-# Correlation caches — 1.5GB+ of .npy / .pkl. Rebuild on Colab with Q5_FINE=1.
-cache/
-cache_v2/
-cache_v3/
-cache_hpc/
-logs/
+# Old approaches, caches, lecture PDFs, logs and past submissions (kept locally, not tracked)
+archive/
+
+# Notebook outputs
+/submission*.csv
 
 # Python / OS
 __pycache__/
@@ -13,17 +12,3 @@ venv/
 .env
 .DS_Store
 .ipynb_checkpoints/
-
-# Lecture slides and extracted slide text (50MB+). Not needed to run the pipeline.
-*.pdf
-_lectures/
-
-# Huge executed homework notebook (~22MB of outputs)
-Computer_Vision_Project_1_(Q1_4)_Merchants_Of_San_Ramon.ipynb
-
-# Generated Kaggle CSVs (keep participant/sample_submission.csv)
-/submission_*.csv
-
-# Resumable prediction checkpoints
-/submission_*.checkpoints/
-/submission_*.csv.partial
